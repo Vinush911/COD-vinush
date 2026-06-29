@@ -2,6 +2,11 @@ package com.example.codbenchmarker
 
 import android.os.Bundle
 import android.widget.TextView
+import android.widget.SeekBar
+import android.widget.Button
+import android.view.View
+import android.view.animation.AlphaAnimation
+import android.view.animation.Animation
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -10,6 +15,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.util.concurrent.Executors
 import android.util.Log
+import org.opencv.android.OpenCVLoader
 
 class MainActivity : AppCompatActivity() {
 
@@ -18,13 +24,30 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fpsView: TextView
     private lateinit var latencyView: TextView
     private lateinit var ramView: TextView
+    private lateinit var targetsView: TextView
+
+    private lateinit var confidenceSeekBar: SeekBar
+    private lateinit var confPercentText: TextView
+    private lateinit var threadsCountText: TextView
+    private lateinit var btnDecThreads: Button
+    private lateinit var btnIncThreads: Button
+    private lateinit var liveIndicatorDot: View
 
     private var frameCount = 0
     private var lastFpsTimestamp = System.currentTimeMillis()
     private var currentFps = 0
+    private var currentThreads = 4
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Initialize OpenCV natively
+        if (!OpenCVLoader.initDebug()) {
+            Log.e("COD_DEBUG", "OpenCV initialization failed!")
+        } else {
+            Log.d("COD_DEBUG", "OpenCV initialized successfully.")
+        }
+
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
@@ -32,8 +55,51 @@ class MainActivity : AppCompatActivity() {
         fpsView = findViewById(R.id.fpsVal)
         latencyView = findViewById(R.id.latencyVal)
         ramView = findViewById(R.id.ramVal)
+        targetsView = findViewById(R.id.targetsCountVal)
+
+        confidenceSeekBar = findViewById(R.id.confidenceSeekBar)
+        confPercentText = findViewById(R.id.confPercentText)
+        threadsCountText = findViewById(R.id.threadsCountText)
+        btnDecThreads = findViewById(R.id.btnDecThreads)
+        btnIncThreads = findViewById(R.id.btnIncThreads)
+        liveIndicatorDot = findViewById(R.id.liveIndicatorDot)
+
+        // Blinking red dot animation for tactical HUD feed
+        val pulseAnimation = AlphaAnimation(1.0f, 0.1f).apply {
+            duration = 600
+            repeatMode = Animation.REVERSE
+            repeatCount = Animation.INFINITE
+        }
+        liveIndicatorDot.startAnimation(pulseAnimation)
 
         detector = CamouflageDetector(this, "yolov8n_float32.tflite")
+
+        // Wire Confidence Seekbar
+        confidenceSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val threshold = progress / 100f
+                confPercentText.text = "$progress%"
+                detector?.setConfidenceThreshold(threshold)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+
+        // Wire Thread adjustments
+        btnDecThreads.setOnClickListener {
+            if (currentThreads > 1) {
+                currentThreads--
+                threadsCountText.text = currentThreads.toString()
+                detector?.setThreadCount(currentThreads)
+            }
+        }
+        btnIncThreads.setOnClickListener {
+            if (currentThreads < 8) {
+                currentThreads++
+                threadsCountText.text = currentThreads.toString()
+                detector?.setThreadCount(currentThreads)
+            }
+        }
 
         if (allPermissionsGranted()) startCamera()
         else requestPermissions(arrayOf(android.Manifest.permission.CAMERA), 101)
@@ -66,6 +132,10 @@ class MainActivity : AppCompatActivity() {
             val boxes = detector?.runInference(imageProxy) ?: emptyList()
             val latency = (System.nanoTime() - start) / 1_000_000.0
 
+            val rotation = imageProxy.imageInfo.rotationDegrees
+            val frameWidth = if (rotation == 90 || rotation == 270) imageProxy.height else imageProxy.width
+            val frameHeight = if (rotation == 90 || rotation == 270) imageProxy.width else imageProxy.height
+
             frameCount++
             val currentTime = System.currentTimeMillis()
             var updateMetricsUI = false
@@ -79,7 +149,6 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread {
                 if (updateMetricsUI) {
-                    // BERSERKER: Correctly fetch RAM here and assign it
                     val runtime = Runtime.getRuntime()
                     val usedMemMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
 
@@ -87,11 +156,13 @@ class MainActivity : AppCompatActivity() {
                     fpsView.text = "$currentFps FPS"
                     ramView.text = "$usedMemMb MB"
                 }
+                targetsView.text = String.format("%02d", boxes.size)
+                overlay.setFrameSize(frameWidth, frameHeight)
                 overlay.setResults(boxes)
                 overlay.invalidate()
             }
         } catch (e: Exception) {
-            Log.e("MLPerf_Terminal", "Inference Error: ${e.message}")
+            Log.e("COD_DEBUG", "Inference Error: ${e.message}")
         } finally {
             imageProxy.close()
         }

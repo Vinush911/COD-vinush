@@ -6,11 +6,17 @@ import android.util.Log
 import androidx.camera.core.ImageProxy
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.DataType
+import org.opencv.core.Mat
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.exp
 
 data class Detection(
     val box: RectF,
@@ -25,16 +31,17 @@ class CamouflageDetector(
 
     private var interpreter: Interpreter
     private val inputSize = 640
+    private val modelBuffer: ByteBuffer = loadModel(context, modelName)
+
+    private var confidenceThreshold = 0.3f
 
     // BERSERKER: Pre-allocate Memory to eliminate GC stutters and drop Latency
     private val inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).apply {
         order(ByteOrder.nativeOrder())
     }
-    private val intValues = IntArray(inputSize * inputSize)
+    private val pixelBuffer = ByteArray(inputSize * inputSize * 3)
 
     init {
-        val modelBuffer = loadModel(context, modelName)
-
         // BERSERKER: Force TFLite to use 4 threads to match your UI readout
         val options = Interpreter.Options().apply {
             numThreads = 4
@@ -53,6 +60,20 @@ class CamouflageDetector(
         )
     }
 
+    fun setThreadCount(threads: Int) {
+        synchronized(this) {
+            interpreter.close()
+            val options = Interpreter.Options().apply {
+                numThreads = threads
+            }
+            interpreter = Interpreter(modelBuffer, options)
+        }
+    }
+
+    fun setConfidenceThreshold(threshold: Float) {
+        confidenceThreshold = threshold
+    }
+
     fun runInference(image: ImageProxy): List<Detection> {
         return try {
             preprocess(image) // Fills the pre-allocated inputBuffer
@@ -68,11 +89,9 @@ class CamouflageDetector(
 
             // ARCHITECT FIX: Explicitly rewind the buffer pointer to the beginning before TFLite reads it.
             inputBuffer.rewind()
-            interpreter.run(inputBuffer, output)
-            Log.d("YOLO_DEBUG", "cx raw: ${output[0][0][0]}")
-            Log.d("YOLO_DEBUG", "cy raw: ${output[0][1][0]}")
-            Log.d("YOLO_DEBUG", "w raw: ${output[0][2][0]}")
-            Log.d("YOLO_DEBUG", "h raw: ${output[0][3][0]}")
+            synchronized(this) {
+                interpreter.run(inputBuffer, output)
+            }
 
             postProcess(output[0], shape[1], shape[2])
         } catch (e: Exception) {
@@ -84,36 +103,45 @@ class CamouflageDetector(
 
     @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
     private fun preprocess(image: ImageProxy) {
-        val bitmap = imageProxyToBitmap(image)
-        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val rowStride = plane.rowStride
 
+        // Create OpenCV Mat directly from RGBA ImageProxy buffer (no Java Bitmap allocations)
+        val mat = Mat(image.height, image.width, CvType.CV_8UC4, buffer, rowStride.toLong())
+
+        // Rotate natively
+        val rotatedMat = Mat()
+        when (image.imageInfo.rotationDegrees) {
+            90 -> Core.rotate(mat, rotatedMat, Core.ROTATE_90_CLOCKWISE)
+            180 -> Core.rotate(mat, rotatedMat, Core.ROTATE_180)
+            270 -> Core.rotate(mat, rotatedMat, Core.ROTATE_90_COUNTERCLOCKWISE)
+            else -> mat.copyTo(rotatedMat)
+        }
+
+        // Convert RGBA -> RGB
+        val rgbMat = Mat()
+        Imgproc.cvtColor(rotatedMat, rgbMat, Imgproc.COLOR_RGBA2RGB)
+
+        // Resize natively to 640x640
+        val resizedMat = Mat()
+        Imgproc.resize(rgbMat, resizedMat, Size(inputSize.toDouble(), inputSize.toDouble()))
+
+        // Copy raw pixel bytes to pre-allocated ByteArray in a single JNI call
+        resizedMat.get(0, 0, pixelBuffer)
+
+        // Normalize and copy to inputBuffer
         inputBuffer.rewind()
-        resized.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
-
-        // ARCHITECT FIX: Restored the / 255f logic.
-        // Standard YOLOv8 TFLite models absolutely require 0.0-1.0 float normalization.
-        for (pixel in intValues) {
-            inputBuffer.putFloat(((pixel shr 16) and 0xFF) / 255f)
-            inputBuffer.putFloat(((pixel shr 8) and 0xFF) / 255f)
-            inputBuffer.putFloat((pixel and 0xFF) / 255f)
-        }
-    }
-
-    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
-    private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
-        // BERSERKER: Try CameraX native conversion first. If hardware fails, fallback to blank bitmap.
-        val sourceBitmap = try {
-            image.toBitmap()
-        } catch (e: Exception) {
-            Log.e("MLPerf_Terminal", "toBitmap() Failed: ${e.message}")
-            Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+        for (i in 0 until (inputSize * inputSize * 3)) {
+            val byteVal = pixelBuffer[i].toInt() and 0xFF
+            inputBuffer.putFloat(byteVal / 255f)
         }
 
-        val matrix = Matrix().apply {
-            postRotate(image.imageInfo.rotationDegrees.toFloat())
-        }
-
-        return Bitmap.createBitmap(sourceBitmap, 0, 0, sourceBitmap.width, sourceBitmap.height, matrix, true)
+        // Clean up native mats immediately
+        mat.release()
+        rotatedMat.release()
+        rgbMat.release()
+        resizedMat.release()
     }
 
     private fun postProcess(output: Array<FloatArray>, dim1: Int, dim2: Int): List<Detection> {
@@ -135,7 +163,7 @@ class CamouflageDetector(
                 val classScore = if (isTransposed) output[i][4 + c] else output[4 + c][i]
 
                 // APPLY SIGMOID (IMPORTANT)
-                val score = classScore
+                val score = 1.0f / (1.0f + exp(-classScore))
 
                 if (score > maxConf) {
                     maxConf = score
@@ -143,9 +171,9 @@ class CamouflageDetector(
                 }
             }
 
-            // BERSERKER & ARCHITECT: STRICT HUMAN FILTER. Class 0 is Person.
-            // Lowered confidence from 0.25f to 0.15f to test inference pipeline sensitivity.
-            if (maxConf > 0.3f && maxClassIndex == 0){
+            // Detect people only (Class index 0 in COCO models)
+            if (maxConf > confidenceThreshold && maxClassIndex == 0) {
+                // Coordinates from this TFLite model are already normalized between 0.0 and 1.0
                 val left = cx - w / 2f
                 val top = cy - h / 2f
                 val right = cx + w / 2f
@@ -153,7 +181,12 @@ class CamouflageDetector(
 
                 detections.add(
                     Detection(
-                        RectF(left, top, right, bottom),
+                        RectF(
+                            max(0f, left),
+                            max(0f, top),
+                            min(1f, right),
+                            min(1f, bottom)
+                        ),
                         maxConf,
                         "PERSON"
                     )
@@ -174,7 +207,7 @@ class CamouflageDetector(
             sorted.removeAll { iou(best.box, it.box) > iouThreshold }
         }
 
-        return result.take(5)
+        return result.take(10) // Allow up to 10 detected people
     }
 
     private fun iou(a: RectF, b: RectF): Float {
@@ -191,6 +224,8 @@ class CamouflageDetector(
     }
 
     fun close() {
-        interpreter.close()
+        synchronized(this) {
+            interpreter.close()
+        }
     }
 }

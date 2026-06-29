@@ -34,7 +34,7 @@ android {
     }
     packagingOptions {
         jniLibs {
-            useLegacyPackaging = false
+            useLegacyPackaging = true
         }
     @Suppress("DEPRECATION")
     aaptOptions {
