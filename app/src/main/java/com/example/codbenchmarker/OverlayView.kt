@@ -116,27 +116,27 @@ class OverlayView(context: Context, attrs: AttributeSet) : View(context, attrs) 
             canvas.drawLine(rect.right, rect.bottom, rect.right, rect.bottom - cornerLen, cornerPaint)
 
             // 4. Draw label tag at the top
-            val labelText = String.format("%s %.0f%%", det.label, det.score * 100)
+            val labelText = det.formattedLabel
             val textWidth = textPaint.measureText(labelText)
             val textHeight = 34f
             val padding = 8f
 
+            val tagWidth = textWidth + (padding * 2)
+            val tagLeft = maxOf(0f, minOf(rect.left, viewWidth - tagWidth))
+
             val tagRect = RectF(
-                rect.left,
+                tagLeft,
                 rect.top - textHeight - (padding * 2),
-                rect.left + textWidth + (padding * 2),
+                tagLeft + tagWidth,
                 rect.top
             )
             
             // Adjust tag if it goes above the screen
             if (tagRect.top < 0) {
                 tagRect.offsetTo(tagRect.left, rect.top)
-                canvas.drawRect(tagRect, tagBackgroundPaint)
-                canvas.drawText(labelText, tagRect.left + padding, tagRect.bottom - padding, textPaint)
-            } else {
-                canvas.drawRect(tagRect, tagBackgroundPaint)
-                canvas.drawText(labelText, tagRect.left + padding, tagRect.bottom - padding, textPaint)
             }
+            canvas.drawRect(tagRect, tagBackgroundPaint)
+            canvas.drawText(labelText, tagRect.left + padding, tagRect.bottom - padding, textPaint)
         }
     }
 

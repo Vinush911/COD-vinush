@@ -51,6 +51,7 @@ class MainActivity : AppCompatActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_main)
 
+        // Bind HUD Views
         overlay = findViewById(R.id.boundingBoxOverlay)
         fpsView = findViewById(R.id.fpsVal)
         latencyView = findViewById(R.id.latencyVal)
@@ -72,7 +73,7 @@ class MainActivity : AppCompatActivity() {
         }
         liveIndicatorDot.startAnimation(pulseAnimation)
 
-        detector = CamouflageDetector(this, "yolov8n_float32.tflite")
+        detector = CamouflageDetector(this, "yolov8n_float16.tflite")
 
         // Wire Confidence Seekbar
         confidenceSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {

@@ -33,3 +33,7 @@ opencv/
 app/release/
 *.zip
 *.apk
+
+# Decompilation temporary files
+jadx_tool/
+old_code_decompiled/

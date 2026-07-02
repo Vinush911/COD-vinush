@@ -15,7 +15,6 @@ object ModelBenchmarker {
         Log.i(TAG, "-".repeat(60))
 
         images.forEachIndexed { index, bitmap ->
-            Runtime.getRuntime().gc()
             val startMemory = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()
             val startTime = System.nanoTime()
 

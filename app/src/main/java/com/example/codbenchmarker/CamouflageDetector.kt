@@ -21,7 +21,8 @@ import kotlin.math.exp
 data class Detection(
     val box: RectF,
     val score: Float,
-    val label: String
+    val label: String,
+    val formattedLabel: String = String.format(java.util.Locale.US, "%s %.0f%%", label, score * 100)
 )
 
 class CamouflageDetector(
@@ -33,7 +34,7 @@ class CamouflageDetector(
     private val inputSize = 640
     private val modelBuffer: ByteBuffer = loadModel(context, modelName)
 
-    private var confidenceThreshold = 0.3f
+    private var confidenceThreshold = 0.55f
 
     // BERSERKER: Pre-allocate Memory to eliminate GC stutters and drop Latency
     private val inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4).apply {
@@ -47,6 +48,17 @@ class CamouflageDetector(
             numThreads = 4
         }
         interpreter = Interpreter(modelBuffer, options)
+
+        // Log model info for debug and compatibility verification of INT8/FP16 models
+        try {
+            val inputTensor = interpreter.getInputTensor(0)
+            val outputTensor = interpreter.getOutputTensor(0)
+            Log.i("MLPerf_Terminal", "Model Loaded: $modelName")
+            Log.i("MLPerf_Terminal", "Input Tensor: DataType=${inputTensor.dataType()}, Shape=${inputTensor.shape().contentToString()}")
+            Log.i("MLPerf_Terminal", "Output Tensor: DataType=${outputTensor.dataType()}, Shape=${outputTensor.shape().contentToString()}")
+        } catch (e: Exception) {
+            Log.e("MLPerf_Terminal", "Error reading tensor details: ${e.message}")
+        }
     }
 
     private fun loadModel(context: Context, modelName: String): ByteBuffer {
@@ -148,32 +160,24 @@ class CamouflageDetector(
         val detections = mutableListOf<Detection>()
         val isTransposed = dim1 > dim2
         val numBoxes = if (isTransposed) dim1 else dim2
-        val numAttributes = if (isTransposed) dim2 else dim1
 
         for (i in 0 until numBoxes) {
-            val cx = if (isTransposed) output[i][0] else output[0][i]
-            val cy = if (isTransposed) output[i][1] else output[1][i]
-            val w  = if (isTransposed) output[i][2] else output[2][i]
-            val h  = if (isTransposed) output[i][3] else output[3][i]
+            val score = if (isTransposed) output[i][4] else output[4][i]
 
-            var maxConf = 0f
-            var maxClassIndex = -1
+            if (score > confidenceThreshold) {
+                var cx = if (isTransposed) output[i][0] else output[0][i]
+                var cy = if (isTransposed) output[i][1] else output[1][i]
+                var w  = if (isTransposed) output[i][2] else output[2][i]
+                var h  = if (isTransposed) output[i][3] else output[3][i]
 
-            for (c in 0 until (numAttributes - 4)) {
-                val classScore = if (isTransposed) output[i][4 + c] else output[4 + c][i]
-
-                // APPLY SIGMOID (IMPORTANT)
-                val score = 1.0f / (1.0f + exp(-classScore))
-
-                if (score > maxConf) {
-                    maxConf = score
-                    maxClassIndex = c
+                // Automatically detect and normalize raw pixel coordinates (some INT8 exports use 0..640 instead of 0..1)
+                if (cx > 1f || cy > 1f || w > 1f || h > 1f) {
+                    cx /= 640f
+                    cy /= 640f
+                    w /= 640f
+                    h /= 640f
                 }
-            }
 
-            // Detect people only (Class index 0 in COCO models)
-            if (maxConf > confidenceThreshold && maxClassIndex == 0) {
-                // Coordinates from this TFLite model are already normalized between 0.0 and 1.0
                 val left = cx - w / 2f
                 val top = cy - h / 2f
                 val right = cx + w / 2f
@@ -182,12 +186,12 @@ class CamouflageDetector(
                 detections.add(
                     Detection(
                         RectF(
-                            max(0f, left),
-                            max(0f, top),
-                            min(1f, right),
-                            min(1f, bottom)
+                            max(0f, min(1f, left)),
+                            max(0f, min(1f, top)),
+                            min(1f, max(0f, right)),
+                            min(1f, max(0f, bottom))
                         ),
-                        maxConf,
+                        score,
                         "PERSON"
                     )
                 )
@@ -199,15 +203,25 @@ class CamouflageDetector(
 
     private fun nms(detections: List<Detection>, iouThreshold: Float = 0.5f): List<Detection> {
         val result = mutableListOf<Detection>()
-        val sorted = detections.sortedByDescending { it.score }.toMutableList()
+        val sorted = detections.sortedByDescending { it.score }
+        val suppressed = BooleanArray(sorted.size)
 
-        while (sorted.isNotEmpty()) {
-            val best = sorted.removeAt(0)
+        for (i in sorted.indices) {
+            if (suppressed[i]) continue
+
+            val best = sorted[i]
             result.add(best)
-            sorted.removeAll { iou(best.box, it.box) > iouThreshold }
+
+            if (result.size >= 10) break
+
+            for (j in (i + 1) until sorted.size) {
+                if (!suppressed[j] && iou(best.box, sorted[j].box) > iouThreshold) {
+                    suppressed[j] = true
+                }
+            }
         }
 
-        return result.take(10) // Allow up to 10 detected people
+        return result
     }
 
     private fun iou(a: RectF, b: RectF): Float {
